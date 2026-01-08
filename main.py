@@ -13,6 +13,8 @@ from crewai.tools import tool
 from tavily import TavilyClient
 from dotenv import load_dotenv
 
+from create_agents import create_agents, create_tasks
+
 load_dotenv()
 
 # API Key Configuration
@@ -122,71 +124,9 @@ def web_search_tool(query: str) -> str:
         return f"Web search error: {str(e)}"
 
 # Agent Definitions
-def create_agents():
-    researcher = Agent(
-        role="Research Specialist",
-        goal="Find accurate and relevant information to answer questions",
-        backstory=(
-            "You are an expert researcher with access to two tools:\n"
-            "1. PDF Search Tool: Use for questions about transformers, attention mechanisms, "
-            "encoders, decoders, or the 'Attention is All You Need' paper\n"
-            "2. Web Search Tool: Use for general questions, recent developments, or other topics\n"
-            "Choose the most appropriate tool based on the question."
-        ),
-        verbose=True,
-        allow_delegation=False,
-        llm=llm,
-    )
 
-    writer = Agent(
-        role="Answer Writer",
-        goal="Create clear, accurate, and helpful answers",
-        backstory=(
-            "You are an expert at synthesizing information into clear answers. "
-            "You always base your responses on the provided research and cite sources when relevant."
-        ),
-        verbose=True,
-        allow_delegation=False,
-        llm=llm,
-    )
 
-    return [researcher, writer]
-
-# Task Definitions
-def create_tasks(agents, tools):
-    pdf_tool, web_tool = tools
-    researcher, writer = agents
-
-    research_task = Task(
-        description=(
-            "Research the following question: {question}\n\n"
-            "Guidelines:\n"
-            "- For questions about transformers, attention, encoders, or decoders: use PDF Search Tool\n"
-            "- For other questions or recent information: use Web Search Tool\n"
-            "- Gather comprehensive information to answer the question thoroughly"
-        ),
-        expected_output="Detailed research findings relevant to the question",
-        agent=researcher,
-        tools=[pdf_tool, web_tool],
-    )
-
-    writing_task = Task(
-        description=(
-            "Using the research provided, write a clear and accurate answer to: {question}\n\n"
-            "Guidelines:\n"
-            "- Be concise but comprehensive\n"
-            "- Base your answer entirely on the research provided\n"
-            "- Explain technical concepts clearly\n"
-            "- If the information comes from the PDF, mention it's from the 'Attention is All You Need' paper"
-        ),
-        expected_output="A clear, well-written answer to the question",
-        agent=writer,
-        context=[research_task],
-    )
-
-    return [research_task, writing_task]
-
-# Main RAG Function
+# Main RAG Function with Fact Checking and Retry Logic
 def run_rag_pipeline(question):
     try:
         # Download PDF if not exists
@@ -198,22 +138,125 @@ def run_rag_pipeline(question):
         # Setup tools
         tools = [pdf_search_tool, web_search_tool]
 
-        # Create agents
-        agents = create_agents()
+        # Retry logic variables
+        max_retries = 2
+        retries = 0
+        previous_response = None
+        
+        while retries <= max_retries:
+            print(f"\n{'='*60}")
+            print(f"Attempt {retries + 1} of {max_retries + 1}")
+            print(f"{'='*60}\n")
+            
+            # Modify question with retry context if needed
+            current_question = question
+            if retries > 0 and previous_response:
+                current_question = (
+                    f"IMPORTANT: This is attempt #{retries + 1}. "
+                    f"The previous answer was INCORRECT according to fact checking.\n\n"
+                    f"Previous incorrect response:\n{previous_response}\n\n"
+                    f"Please research more carefully and provide a different, accurate answer.\n\n"
+                    f"Original question: {question}"
+                )
+                print("⚠️  Retrying with corrected context...\n")
 
-        # Create tasks
-        tasks = create_tasks(agents, tools)
+            # Create agents
+            agents = create_agents()
 
-        # Create Crew
-        rag_crew = Crew(
-            agents=agents,
-            tasks=tasks,
-            verbose=True,
-        )
+            # Create tasks
+            tasks = create_tasks(agents, tools)
 
-        # Run the pipeline
-        result = rag_crew.kickoff(inputs={"question": question})
-        return str(result)
+            # Create Crew
+            rag_crew = Crew(
+                agents=agents,
+                tasks=tasks,
+                verbose=True,
+            )
+
+            # Run the pipeline
+            result = rag_crew.kickoff(inputs={"question": current_question})
+            
+            # Get individual task outputs
+            # Tasks order: research_task, fact_checking_task, writing_task
+            tasks_output = rag_crew.tasks_output if hasattr(rag_crew, 'tasks_output') else None
+            
+            # Extract fact checker verdict and writer's answer
+            fact_check_output = None
+            writer_output = str(result)  # Final output is writer's response
+            verdict_passed = True
+            
+            # Try to get fact checker output from tasks
+            if tasks_output and len(tasks_output) >= 2:
+                # Second task is fact checking
+                fact_check_output = str(tasks_output[1].raw) if hasattr(tasks_output[1], 'raw') else str(tasks_output[1])
+                
+                # Check the verdict
+                if "VERDICT: FALSE" in fact_check_output or "verdict: false" in fact_check_output.lower():
+                    verdict_passed = False
+                    print("\n" + "="*60)
+                    print("❌ FACT CHECK FAILED - Research deemed inaccurate")
+                    print("="*60 + "\n")
+                    
+                    # Extract the reason if available
+                    if "REASON:" in fact_check_output:
+                        reason_start = fact_check_output.find("REASON:")
+                        reason_end = reason_start + 200
+                        reason_text = fact_check_output[reason_start:reason_end]
+                        print(f"Fact checker's feedback: {reason_text}\n")
+                    
+                elif "VERDICT: TRUE" in fact_check_output or "verdict: true" in fact_check_output.lower():
+                    verdict_passed = True
+                    print("\n" + "="*60)
+                    print("✅ FACT CHECK PASSED - Research verified as accurate")
+                    print("="*60 + "\n")
+            else:
+                # Fallback: check if verdict is in the final output
+                result_str = str(result)
+                if "VERDICT: FALSE" in result_str or "verdict: false" in result_str.lower():
+                    verdict_passed = False
+                    # Extract writer's response (everything after the last occurrence of REASON:)
+                    if "REASON:" in result_str:
+                        parts = result_str.split("REASON:")
+                        if len(parts) > 1:
+                            # Get text after reason
+                            writer_output = parts[-1].split("\n", 1)[-1].strip()
+                    
+                    print("\n" + "="*60)
+                    print("❌ FACT CHECK FAILED - Research deemed inaccurate")
+                    print("="*60 + "\n")
+            
+            # If fact check passed, return the writer's answer
+            if verdict_passed:
+                # Clean up the writer's output - remove any verdict text if present
+                clean_output = writer_output
+                if "VERDICT:" in clean_output:
+                    # Remove everything from VERDICT onwards
+                    clean_output = clean_output.split("VERDICT:")[0].strip()
+                
+                return clean_output
+            
+            # If fact check failed and we have retries left
+            if retries < max_retries:
+                # Store the research output for retry context
+                if tasks_output and len(tasks_output) >= 1:
+                    research_output = str(tasks_output[0].raw) if hasattr(tasks_output[0], 'raw') else str(tasks_output[0])
+                    previous_response = f"Research findings: {research_output}\n\nFact check result: {fact_check_output}"
+                else:
+                    previous_response = str(result)
+                    
+                retries += 1
+                print(f"🔄 Retrying... (Attempt {retries + 1} of {max_retries + 1})\n")
+                continue
+            else:
+                # Exhausted all retries
+                print("\n" + "="*60)
+                print("⚠️  Maximum retries reached. Returning best available answer.")
+                print("="*60 + "\n")
+                return (
+                    f"Note: After {max_retries + 1} attempts, the system could not fully verify "
+                    f"the answer. Here is the most recent response:\n\n"
+                    f"{writer_output}"
+                )
         
     except Exception as e:
         import traceback
